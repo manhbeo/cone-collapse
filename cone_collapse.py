@@ -4,10 +4,11 @@ import time
 import os
 from utils import plotting
 
+
 class ConeCollapse:
     def __init__(self, theta=0.1, max_iters=100, tol=1e-6, batch_size=32,
                  verbose=True, plot=False, adaptive_theta=True, early_stopping=True,
-                 device=None):
+                 device=None, error_metric='frobenius'):
         """
         Initialize the PyTorch Cone Collapsing algorithm.
 
@@ -21,6 +22,7 @@ class ConeCollapse:
             adaptive_theta (bool): Whether to use adaptive theta values.
             early_stopping (bool): Whether to use early stopping criteria.
             device (str): PyTorch device to use ('cuda', 'cpu', or None for auto-detection).
+            error_metric (str): Error metric to use ('frobenius' or 'kl_divergence').
         """
         self.theta = theta
         self.max_iters = max_iters
@@ -30,53 +32,27 @@ class ConeCollapse:
         self.plot = plot
         self.adaptive_theta = adaptive_theta
         self.early_stopping = early_stopping
+        self.error_metric = error_metric
 
         # Set device (use GPU if available)
         if device is None:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.device = torch.device('mps')
         else:
             self.device = torch.device(device)
 
         if self.verbose:
             print(f"Using device: {self.device}")
+            print(f"Using error metric: {self.error_metric}")
 
     def projection(self, u, mu):
-        """Calculate the projection of mu onto u using PyTorch."""
+        """Calculate the projection of mu onto u."""
         dot_product = torch.dot(u, mu)
         return (dot_product / torch.dot(u, u)) * u
-
-    def update_vector(self, ui, mu, theta):
-        """
-        Update the vector ui towards the vector mu by an angle theta.
-        PyTorch implementation.
-        """
-        # Pre-compute dot products
-        ui_dot_mu = torch.dot(ui, mu)
-        ui_squared = torch.dot(ui, ui)
-
-        # Project mu onto the span of ui
-        mu_tilde = (ui_dot_mu / ui_squared) * ui
-
-        # Calculate component of mu orthogonal to ui
-        mu_perp = mu - mu_tilde
-
-        # Calculate norms
-        mu_perp_norm = torch.norm(mu_perp)
-        mu_tilde_norm = torch.norm(mu_tilde)
-
-        if mu_tilde_norm <= 1e-12 or mu_perp_norm <= 1e-12:
-            # Avoid division by zero in case of degenerate situations
-            return ui
-        else:
-            # Implement the formula from the paper
-            tan_theta = torch.tan(torch.tensor(theta, device=self.device))
-            ui_prime = mu_tilde + (mu_tilde_norm * tan_theta) * (mu_perp / mu_perp_norm)
-            return ui_prime / torch.norm(ui_prime)
 
     def batch_update_vectors(self, U, mu, theta):
         """
         Update all vectors in U towards mu by angle theta in a batch operation.
-        PyTorch implementation with vectorized operations.
         """
         # Get dimensions
         m, k = U.size()
@@ -143,6 +119,7 @@ class ConeCollapse:
 
             if len(outside_sample) == 0:
                 # If no points in sample are outside, check a few more random points
+                # TODO: need to prove this
                 extra_indices = torch.randperm(n)[:min(self.batch_size, n)]
                 X_extra = X[:, extra_indices]
                 outside_extra_mask = self._batch_check_outside_cone(X_extra, U)
@@ -281,10 +258,10 @@ class ConeCollapse:
 
         # Calculate the full projection error as baseline
         X_proj = torch.matmul(U, torch.matmul(U.t(), X))
-        baseline_error = torch.sum((X - X_proj) ** 2)
+        baseline_error = torch.norm(X - X_proj, p='fro')
 
         # Compute importance in batches to avoid memory issues
-        batch_size = min(5, k)  # Process rays in small batches
+        batch_size = min(5, k)  # Process rays in small batches #TODO: make this a hyperparam
 
         for start_idx in range(0, k, batch_size):
             end_idx = min(start_idx + batch_size, k)
@@ -299,7 +276,7 @@ class ConeCollapse:
 
                 # Calculate the projection error without this ray
                 X_proj_reduced = torch.matmul(U_reduced, torch.matmul(U_reduced.t(), X))
-                error_without_j = torch.sum((X - X_proj_reduced) ** 2)
+                error_without_j = torch.norm(X - X_proj_reduced, p='fro')
 
                 # The importance is how much the error increases if we remove this ray
                 importance[j] = error_without_j - baseline_error
@@ -309,6 +286,33 @@ class ConeCollapse:
         U_reduced = U[:, indices]
 
         return U_reduced
+
+    def calculate_error(self, X, X_recon):
+        """
+        Calculate error between original data X and reconstructed data X_recon.
+
+        Args:
+            X (torch.Tensor): Original data matrix
+            X_recon (torch.Tensor): Reconstructed data matrix
+
+        Returns:
+            float: Error value based on the selected error metric
+        """
+        if self.error_metric == 'kl_divergence':
+            # Kullback-Leibler divergence
+            # Add small epsilon to avoid log(0)
+            epsilon = 1e-10
+            X_safe = X + epsilon
+            X_recon_safe = X_recon + epsilon
+
+            # KL divergence formula: sum(X * log(X/X_recon) - X + X_recon)
+            kl_div = torch.sum(X_safe * torch.log(X_safe / X_recon_safe) - X_safe + X_recon_safe)
+
+            # Normalize by the sum of X
+            return kl_div.item()
+        else:
+            # Default to relative Frobenius norm if unknown metric is specified
+            return torch.norm(X - X_recon, p='fro').item()
 
     def fit(self, X_np, r=None):
         """
@@ -375,8 +379,7 @@ class ConeCollapse:
                     # Compute coefficients and check error
                     V = self.compute_coefficients(X, U)
                     X_recon = torch.matmul(U, V)
-                    current_error = torch.norm(X - X_recon) / torch.norm(X)
-                    current_error = current_error.item()  # Convert to Python scalar
+                    current_error = self.calculate_error(X, X_recon)
 
                     # Check for improvement
                     if prev_error - current_error < self.tol:
@@ -390,7 +393,7 @@ class ConeCollapse:
 
                     prev_error = current_error
 
-                if self.plot and m == 3 and iter_num % 5 == 0:
+                if self.plot and m == 3:
                     plotting(X_np, U.cpu().numpy(), iter_num)
                 continue
 
@@ -410,7 +413,7 @@ class ConeCollapse:
                 new_points_added += 1
 
                 # If we've added many points, check if we should eliminate some
-                if r is not None and U.size(1) > r + 5:  # Add some buffer
+                if r is not None and U.size(1) > r + 5:  # Add some buffer #TODO: make this a hyperparam
                     break
 
             if new_points_added > 0 and self.verbose:
@@ -438,13 +441,17 @@ class ConeCollapse:
 
         # Calculate final error
         X_recon = torch.matmul(U, V)
-        final_error = (torch.norm(X - X_recon) / torch.norm(X)).item()
+        final_error = self.calculate_error(X, X_recon)
+
+        # Plot the final state
+        if self.plot and m == 3:
+            plotting(X_np, U.cpu().numpy(), f"final_{iter_num}")
 
         if self.verbose:
             end_time = time.time()
             print(f"Fitting completed in {end_time - start_time:.2f} seconds")
             print(f"Final U shape: {U.size()}")
-            print(f"Final reconstruction error: {final_error:.6f}")
+            print(f"Final reconstruction error ({self.error_metric}): {final_error:.6f}")
 
         # Convert back to numpy
         U_np = U.cpu().numpy()
